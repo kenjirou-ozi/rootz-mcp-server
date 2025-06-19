@@ -1,168 +1,259 @@
+#!/usr/bin/env node
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import simpleGit, { SimpleGit } from 'simple-git';
-import * as cheerio from 'cheerio';
-import * as fs from 'fs/promises';
-import * as path from 'path';
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError,
+} from '@modelcontextprotocol/sdk/types.js';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import express from 'express';
 
-class RootzMCPService {
-  private git: SimpleGit;
-  private localPath: string = './rootz-sync';
-  private readonly REPO_URL = 'https://github.com/kenjirou-ozi/rootz-project.git';
-  private readonly MAX_FILE_SIZE = 45000;
-  
+const execAsync = promisify(exec);
+
+const REPO_URL = 'https://github.com/kenjirou-ozi/rootz-project.git';
+const LOCAL_PATH = './rootz-project';
+
+class RootzMCPServer {
+  private server: Server;
+
   constructor() {
-    this.git = simpleGit();
-    this.initializeSync();
+    this.server = new Server(
+      {
+        name: 'rootz-mcp-server',
+        version: '1.0.0',
+      },
+      {
+        capabilities: {
+          tools: {},
+        },
+      }
+    );
+
+    this.setupToolHandlers();
+    this.setupErrorHandling();
   }
 
-  async initializeSync() {
+  private setupErrorHandling(): void {
+    this.server.onerror = (error) => console.error('[MCP Error]', error);
+    process.on('SIGINT', async () => {
+      await this.server.close();
+      process.exit(0);
+    });
+  }
+
+  private setupToolHandlers(): void {
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: [
+        {
+          name: 'get_file_content',
+          description: 'Get the content of a specific file from the Rootz project',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'Path to the file relative to project root (e.g., "gsap-exp/header-test.html")',
+              },
+            },
+            required: ['path'],
+          },
+        },
+        {
+          name: 'analyze_html_structure',
+          description: 'Analyze HTML structure and extract CSS classes, IDs, and element hierarchy',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'Path to the HTML file to analyze',
+              },
+            },
+            required: ['path'],
+          },
+        },
+        {
+          name: 'sync_repository',
+          description: 'Sync the latest version of the Rootz project from GitHub',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+      ],
+    }));
+
+    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      switch (request.params.name) {
+        case 'get_file_content':
+          return this.getFileContent(request.params.arguments?.path as string);
+        case 'analyze_html_structure':
+          return this.analyzeHtmlStructure(request.params.arguments?.path as string);
+        case 'sync_repository':
+          return this.syncRepository();
+        default:
+          throw new McpError(
+            ErrorCode.MethodNotFound,
+            `Unknown tool: ${request.params.name}`
+          );
+      }
+    });
+  }
+
+  private async syncRepository() {
     try {
       console.log('🔄 Syncing with Rootz repository...');
-      await fs.rm(this.localPath, { recursive: true, force: true }).catch(() => {});
-      await this.git.clone(this.REPO_URL, this.localPath);
+      
+      // Clone or pull latest changes
+      try {
+        await execAsync(`git clone ${REPO_URL} ${LOCAL_PATH}`);
+      } catch (error) {
+        // If directory exists, pull latest changes
+        await execAsync(`cd ${LOCAL_PATH} && git pull origin main`);
+      }
+
       console.log('✅ Rootz project synced successfully');
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'Repository synced successfully with latest changes from GitHub',
+          },
+        ],
+      };
     } catch (error) {
       console.error('❌ Sync failed:', error);
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to sync repository: ${error}`
+      );
     }
   }
 
-  async pullLatest(): Promise<void> {
+  private async getFileContent(path: string) {
+    if (!path) {
+      throw new McpError(ErrorCode.InvalidParams, 'Path is required');
+    }
+
     try {
-      const git = simpleGit(this.localPath);
-      await git.pull('origin', 'main');
-      console.log('📥 Latest changes pulled');
+      const { stdout } = await execAsync(`cat "${LOCAL_PATH}/${path}"`);
+      
+      // File size limit (45KB)
+      if (stdout.length > 45000) {
+        const truncated = stdout.substring(0, 45000);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `File content (truncated to 45KB):\n\n${truncated}\n\n[Content truncated due to size limit]`,
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `File: ${path}\n\n${stdout}`,
+          },
+        ],
+      };
     } catch (error) {
-      console.error('❌ Pull failed:', error);
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to read file ${path}: ${error}`
+      );
     }
   }
 
-  async getFileContent(filePath: string): Promise<string> {
-    await this.pullLatest();
-    const fullPath = path.join(this.localPath, filePath);
-    const content = await fs.readFile(fullPath, 'utf-8');
-    
-    if (content.length > this.MAX_FILE_SIZE) {
-      return content.slice(0, this.MAX_FILE_SIZE) + '\n\n--- [File truncated] ---';
+  private async analyzeHtmlStructure(path: string) {
+    if (!path) {
+      throw new McpError(ErrorCode.InvalidParams, 'Path is required');
     }
-    return content;
+
+    try {
+      const { stdout } = await execAsync(`cat "${LOCAL_PATH}/${path}"`);
+      
+      // Extract CSS classes
+      const classRegex = /class=["']([^"']+)["']/g;
+      const classes = new Set<string>();
+      let match;
+      while ((match = classRegex.exec(stdout)) !== null) {
+        match[1].split(' ').forEach(cls => classes.add(cls.trim()));
+      }
+
+      // Extract IDs
+      const idRegex = /id=["']([^"']+)["']/g;
+      const ids = new Set<string>();
+      while ((match = idRegex.exec(stdout)) !== null) {
+        ids.add(match[1]);
+      }
+
+      // Extract HTML structure
+      const tagRegex = /<(\w+)[^>]*>/g;
+      const tags = new Set<string>();
+      while ((match = tagRegex.exec(stdout)) !== null) {
+        tags.add(match[1]);
+      }
+
+      const analysis = {
+        file: path,
+        classes: Array.from(classes).sort(),
+        ids: Array.from(ids).sort(),
+        tags: Array.from(tags).sort(),
+        summary: `Found ${classes.size} CSS classes, ${ids.size} IDs, and ${tags.size} different HTML tags`
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `HTML Structure Analysis for: ${path}\n\n${JSON.stringify(analysis, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to analyze file ${path}: ${error}`
+      );
+    }
   }
 
-  async analyzeHTML(filePath: string) {
-    const content = await this.getFileContent(filePath);
-    const $ = cheerio.load(content);
-    
-    const analysis = {
-      classes: [] as string[],
-      ids: [] as string[],
-      elements: [] as Array<{
-        tag: string;
-        class?: string;
-        id?: string;
-      }>
-    };
+  async run(): Promise<void> {
+    // Initial repository sync
+    await this.syncRepository();
 
-    $('*').each((i, elem) => {
-      const $elem = $(elem);
-      const tagName = (elem as any).tagName?.toLowerCase() || 'unknown';
-      
-      const classes = $elem.attr('class');
-      if (classes) {
-        analysis.classes.push(...classes.split(/\s+/));
-      }
-      
-      const id = $elem.attr('id');
-      if (id) {
-        analysis.ids.push(id);
-      }
-      
-      analysis.elements.push({
-        tag: tagName,
-        class: classes,
-        id: id,
-      });
-    });
-
-    analysis.classes = [...new Set(analysis.classes)];
-    analysis.ids = [...new Set(analysis.ids)];
-    
-    return analysis;
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
+    console.log('🚀 Rootz MCP Server running...');
   }
 }
 
-const server = new Server(
-  { name: 'rootz-mcp-server', version: '1.0.0' },
-  { capabilities: { tools: {} } }
-);
+// Express サーバー追加（Render用ポートバインディング）
+const app = express();
+const PORT = process.env.PORT || 10000;
 
-const mcpService = new RootzMCPService();
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: 'get_file_content',
-      description: 'Get content of any file from Rootz project',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          file_path: { type: 'string', description: 'Relative path to file' }
-        },
-        required: ['file_path']
-      }
-    },
-    {
-      name: 'analyze_html_structure', 
-      description: 'Analyze HTML file for classes and structure',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          html_file: { type: 'string', description: 'Path to HTML file' }
-        },
-        required: ['html_file']
-      }
-    }
-  ]
-}));
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  try {
-    const args = request.params.arguments as any;
-    
-    switch (request.params.name) {
-      case 'get_file_content':
-        const content = await mcpService.getFileContent(args.file_path);
-        return {
-          content: [{
-            type: 'text',
-            text: `File: ${args.file_path}\n\n${content}`
-          }]
-        };
-
-      case 'analyze_html_structure':
-        const analysis = await mcpService.analyzeHTML(args.html_file);
-        return {
-          content: [{
-            type: 'text',
-            text: `HTML Analysis for: ${args.html_file}\n\n${JSON.stringify(analysis, null, 2)}`
-          }]
-        };
-
-      default:
-        throw new Error(`Unknown tool: ${request.params.name}`);
-    }
-  } catch (error: any) {
-    return {
-      content: [{ type: 'text', text: `Error: ${error?.message || 'Unknown error'}` }],
-      isError: true
-    };
-  }
+// ヘルスチェックエンドポイント
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'Rootz MCP Server is running',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0'
+  });
 });
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.log('🚀 Rootz MCP Server running...');
-}
+// Render用ポートバインディング
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 HTTP Server running on port ${PORT}`);
+});
 
-main().catch(console.error);
+// MCP Server 起動
+const server = new RootzMCPServer();
+server.run().catch(console.error);
