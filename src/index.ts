@@ -237,7 +237,7 @@ class RootzMCPServer {
 
 // Express サーバー追加（Render用ポートバインディング）
 const app = express();
-const PORT = process.env.PORT || 10000;
+const PORT = parseInt(process.env.PORT || '10000', 10);
 
 // ヘルスチェックエンドポイント
 app.get('/', (req, res) => {
